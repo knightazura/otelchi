@@ -3,6 +3,7 @@ package otelchi
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -372,6 +373,67 @@ func TestSDKIntegrationWithRequestMethodInSpanName(t *testing.T) {
 		attribute.String("http.target", "/book/foo"),
 		attribute.String("http.route", "/book/{title}"),
 	)
+}
+
+func isPanic(w http.ResponseWriter, r *http.Request) {
+	// defer func() {
+	// 	if r := recover(); r != nil {
+	// 		w.WriteHeader(http.StatusInternalServerError)
+	// 		w.Write([]byte(fmt.Sprintf("recovered from: %v", r)))
+	// 	}
+	// }()
+	panic(fmt.Errorf("test panic!"))
+}
+
+func TestHandlePanic(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider()
+	provider.RegisterSpanProcessor(sr)
+
+	router := chi.NewRouter()
+	router.Use(
+		Middleware(
+			"foobar",
+			WithTracerProvider(provider),
+			WithRequestMethodInSpanName(true),
+			WithStackTrace(true),
+		),
+	)
+	router.HandleFunc("/user/{id:[0-9]+}", isPanic)
+	router.HandleFunc("/book/{title}", isPanic)
+
+	r0 := httptest.NewRequest("GET", "/user/123", nil)
+	r1 := httptest.NewRequest("GET", "/book/foo", nil)
+	w := httptest.NewRecorder()
+
+	assert.NotPanics(t, func() {
+		router.ServeHTTP(w, r0)
+		router.ServeHTTP(w, r1)
+
+		require.Len(t, sr.Ended(), 2)
+		assertSpan(t, sr.Ended()[0],
+			"GET /user/{id:[0-9]+}",
+			trace.SpanKindServer,
+			attribute.String("http.server_name", "foobar"),
+			attribute.Int("http.status_code", http.StatusInternalServerError),
+			attribute.String("http.method", "GET"),
+			attribute.String("http.target", "/user/123"),
+			attribute.String("http.route", "/user/{id:[0-9]+}"),
+		)
+		assertSpan(t, sr.Ended()[1],
+			"GET /book/{title}",
+			trace.SpanKindServer,
+			attribute.String("http.server_name", "foobar"),
+			attribute.Int("http.status_code", http.StatusInternalServerError),
+			attribute.String("http.method", "GET"),
+			attribute.String("http.target", "/book/foo"),
+			attribute.String("http.route", "/book/{title}"),
+		)
+
+		// this assert only to check whether exception attributes recorded into span or not
+		assert.Fail(t, "fail", fmt.Sprintf("%+v", sr.Ended()[0]))
+
+	}, "should not panic")
 }
 
 func assertSpan(t *testing.T, span sdktrace.ReadOnlySpan, name string, kind trace.SpanKind, attrs ...attribute.KeyValue) {
